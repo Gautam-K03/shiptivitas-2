@@ -95,7 +95,7 @@ app.get('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
   return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
 });
@@ -118,7 +118,7 @@ app.put('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
   let { status, priority } = req.body;
@@ -126,9 +126,54 @@ app.put('/api/v1/clients/:id', (req, res) => {
   const client = clients.find(client => client.id === id);
 
   /* ---------- Update code below ----------*/
+  const validStatuses = ['backlog', 'in-progress', 'complete'];
 
+  if (status !== undefined && !validStatuses.includes(status)) {
+    return res.status(400).send({
+      'message': 'Invalid status provided.',
+      'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+    });
+  }
+  if (priority !== undefined && (!Number.isInteger(priority) || priority < 1)) {
+    return res.status(400).send({
+      'message': 'Invalid priority provided.',
+      'long_message': 'Priority can only be positive integer.',
+    });
+  }
 
+  const oldStatus = client.status;
+  const oldPriority = client.priority;
+  const newStatus = status !== undefined ? status : oldStatus;
 
+  // Nothing to change
+  if (newStatus === oldStatus && priority === undefined) {
+    return res.status(200).send(clients);
+  }
+
+  const moveClient = db.transaction(() => {
+    // How many other clients are in the target swimlane
+    const { count } = db
+      .prepare('select count(*) as count from clients where status = ? and id != ?')
+      .get(newStatus, id);
+
+    // No priority given: put at the bottom. Otherwise clamp to the lane size.
+    const newPriority = priority === undefined ? count + 1 : Math.min(priority, count + 1);
+
+    // 1. Remove the client from its old lane: close the gap
+    db.prepare('update clients set priority = priority - 1 where status = ? and priority > ? and id != ?')
+      .run(oldStatus, oldPriority, id);
+
+    // 2. Make room in the new lane
+    db.prepare('update clients set priority = priority + 1 where status = ? and priority >= ? and id != ?')
+      .run(newStatus, newPriority, id);
+
+    // 3. Place the client
+    db.prepare('update clients set status = ?, priority = ? where id = ?')
+      .run(newStatus, newPriority, id);
+  });
+  moveClient();
+
+  clients = db.prepare('select * from clients').all();
   return res.status(200).send(clients);
 });
 
